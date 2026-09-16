@@ -26,8 +26,12 @@ inputs:
     description: 'XploitScan API key (xpls_...) — generate one in Settings → API Keys. Required to unlock the full 210+ rule Pro set; without it the action runs the 30 free rules.'
     required: false
     default: ''
+  fail-on-quality:
+    description: 'Also fail the action on high-severity code-quality findings (QA…). Off by default: quality findings are reported either way, and the exit code is a contract with pipelines that were passing before they existed. See https://xploitscan.com/quality'
+    required: false
+    default: 'false'
   grade-vendored:
-    description: 'Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain.'
+    description: 'Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain. NOTE: this input is what the action grades by; `scan.gradeVendored` in .xploitscanrc does not apply here, because the action recomputes the grade from the scan JSON rather than using the CLI''s.'
     required: false
     default: 'false'
   anthropic-api-key:
@@ -57,6 +61,12 @@ outputs:
   ungraded-count:
     description: 'Findings in vendored, generated, or documentation files. Reported and uploaded in the SARIF, but not counted toward the grade or the failure threshold.'
     value: ${{ steps.scan.outputs.ungraded-count }}
+  quality-count:
+    description: 'Code-quality findings (QA…). Never counted toward the grade or the severity counts; see fail-on-quality.'
+    value: ${{ steps.scan.outputs.quality-count }}
+  quality-high-count:
+    description: 'Code-quality findings at high severity or above.'
+    value: ${{ steps.scan.outputs.quality-high-count }}
   critical-count:
     description: 'Number of critical findings'
     value: ${{ steps.scan.outputs.critical-count }}
@@ -134,6 +144,12 @@ runs:
             const total = all.length;
             const gradedTotal = f.length;
             const files = j.filesScanned || 0;
+            // Quality findings ride in their OWN key and are deliberately
+            // absent from every number above: they do not move the grade, the
+            // severity counts, or the default gate. Counted here only so the
+            // summary can mention them and fail-on-quality can act on them.
+            const quality = j.quality || [];
+            const qualityHigh = quality.filter(x => x.severity === 'critical' || x.severity === 'high').length;
             // Scoring matches the web dashboard modal and the CLI calculateGrade function.
             // Keep all three in sync — changing one without the others will produce
             // inconsistent grades between CI, terminal, and the web UI.
@@ -157,6 +173,8 @@ runs:
             console.log('MEDIUM=' + medium);
             console.log('LOW=' + low);
             console.log('UNGRADED=' + ungraded);
+            console.log('QUALITY=' + quality.length);
+            console.log('QUALITY_HIGH=' + qualityHigh);
           } catch(e) {
             console.log('GRADE=?');
             console.log('SCORE=0');
@@ -167,10 +185,14 @@ runs:
             console.log('MEDIUM=0');
             console.log('LOW=0');
             console.log('UNGRADED=0');
+            console.log('QUALITY=0');
+            console.log('QUALITY_HIGH=0');
           }
         ")"
         rm -f "$SCAN_JSON"
 
+        echo "quality-count=$QUALITY" >> $GITHUB_OUTPUT
+        echo "quality-high-count=$QUALITY_HIGH" >> $GITHUB_OUTPUT
         echo "grade=$GRADE" >> $GITHUB_OUTPUT
         echo "score=$SCORE" >> $GITHUB_OUTPUT
         echo "findings-count=$FINDINGS" >> $GITHUB_OUTPUT
@@ -294,6 +316,17 @@ runs:
         # red-line everyone's CI. See packages/shared-rules/src/vendored.ts.
         FINDINGS="${{ steps.scan.outputs.graded-findings-count }}"
         UNGRADED="${{ steps.scan.outputs.ungraded-count }}"
+
+        # Quality findings gate only when asked, and independently of fail-on.
+        # They are a different question from "is this safe to ship", so they get
+        # their own switch rather than riding on the security threshold — and
+        # this check runs even when fail-on is `none`, because opting into one
+        # is not opting into the other.
+        QUALITY_HIGH="${{ steps.scan.outputs.quality-high-count }}"
+        if [ "${{ inputs.fail-on-quality }}" = "true" ] && [ "${QUALITY_HIGH:-0}" -gt 0 ] 2>/dev/null; then
+          echo "XploitScan: $QUALITY_HIGH high-severity code-quality finding(s) and fail-on-quality is set. Failing."
+          exit 1
+        fi
 
         if [ "$FAIL_ON" = "none" ]; then
           echo "XploitScan: No failure threshold set. Passing."
