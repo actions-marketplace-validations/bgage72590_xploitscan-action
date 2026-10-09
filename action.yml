@@ -87,7 +87,7 @@ runs:
   using: 'composite'
   steps:
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: '22'
 
@@ -97,6 +97,9 @@ runs:
       env:
         XPLOITSCAN_API_KEY: ${{ inputs.api-key }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_GRADE_VENDORED: ${{ inputs.grade-vendored }}
+        INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
         # Install xploitscan. Belt-and-suspenders fallback chain:
         #   1) Try `npm install -g` — fastest path when the runner allows
@@ -121,7 +124,7 @@ runs:
 
         # Run scan with JSON output to a temp file (exit code 1 = findings found, not an error)
         SCAN_JSON=$(mktemp)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" --format json $AI_FLAG 1>"$SCAN_JSON" 2>/dev/null || true
+        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" --format json $AI_FLAG 1>"$SCAN_JSON" 2>/dev/null || true
 
         # Parse results — compute grade/score/counts from findings since CLI JSON doesn't include them
         eval "$(node -e "
@@ -134,7 +137,7 @@ runs:
             // them here would red-line CI on scaffold code every project on
             // the platform ships byte-identically. They stay in FINDINGS and
             // in the SARIF upload; only the grade and the gate skip them.
-            const gradeVendored = '${{ inputs.grade-vendored }}' === 'true';
+            const gradeVendored = process.env.INPUT_GRADE_VENDORED === 'true';
             const f = gradeVendored ? all : all.filter(x => !x.vendored);
             const ungraded = all.length - f.length;
             const critical = f.filter(x => x.severity === 'critical').length;
@@ -202,13 +205,13 @@ runs:
         echo "medium-count=$MEDIUM" >> $GITHUB_OUTPUT
         echo "low-count=$LOW" >> $GITHUB_OUTPUT
         echo "ungraded-count=$UNGRADED" >> $GITHUB_OUTPUT
-        echo "sarif-file=${{ inputs.sarif-file }}" >> $GITHUB_OUTPUT
+        echo "sarif-file=$INPUT_SARIF_FILE" >> $GITHUB_OUTPUT
 
         # Generate SARIF output (exit code 1 = findings found, not an error)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" --format sarif $AI_FLAG > "${{ inputs.sarif-file }}" 2>/dev/null || true
+        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" --format sarif $AI_FLAG > "$INPUT_SARIF_FILE" 2>/dev/null || true
         # If SARIF file is empty or doesn't exist, write a valid empty SARIF
-        if [ ! -s "${{ inputs.sarif-file }}" ]; then
-          echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"XploitScan","version":"1.0.0","rules":[]}},"results":[]}]}' > "${{ inputs.sarif-file }}"
+        if [ ! -s "$INPUT_SARIF_FILE" ]; then
+          echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"XploitScan","version":"1.0.0","rules":[]}},"results":[]}]}' > "$INPUT_SARIF_FILE"
         fi
 
         # Print summary
@@ -222,31 +225,40 @@ runs:
         echo "================================="
 
         # Also run terminal output for readable logs (exit code 1 = findings, not error)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" $AI_FLAG 2>&1 || true
+        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" $AI_FLAG 2>&1 || true
 
     - name: Upload SARIF to GitHub Security
       if: hashFiles(inputs.sarif-file) != ''
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
       with:
         sarif_file: ${{ inputs.sarif-file }}
       continue-on-error: true
 
     - name: Post PR Comment
       if: github.event_name == 'pull_request' && inputs.comment == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+      env:
+        SCAN_GRADE: ${{ steps.scan.outputs.grade }}
+        SCAN_SCORE: ${{ steps.scan.outputs.score }}
+        SCAN_FINDINGS: ${{ steps.scan.outputs.findings-count }}
+        SCAN_CRITICAL: ${{ steps.scan.outputs.critical-count }}
+        SCAN_HIGH: ${{ steps.scan.outputs.high-count }}
+        SCAN_MEDIUM: ${{ steps.scan.outputs.medium-count }}
+        SCAN_LOW: ${{ steps.scan.outputs.low-count }}
+        SCAN_UNGRADED: ${{ steps.scan.outputs.ungraded-count }}
       with:
         script: |
-          const grade = '${{ steps.scan.outputs.grade }}';
-          const score = '${{ steps.scan.outputs.score }}';
-          const findings = '${{ steps.scan.outputs.findings-count }}';
-          const critical = '${{ steps.scan.outputs.critical-count }}';
-          const high = '${{ steps.scan.outputs.high-count }}';
-          const medium = '${{ steps.scan.outputs.medium-count }}';
-          const low = '${{ steps.scan.outputs.low-count }}';
+          const grade = process.env.SCAN_GRADE;
+          const score = process.env.SCAN_SCORE;
+          const findings = process.env.SCAN_FINDINGS;
+          const critical = process.env.SCAN_CRITICAL;
+          const high = process.env.SCAN_HIGH;
+          const medium = process.env.SCAN_MEDIUM;
+          const low = process.env.SCAN_LOW;
           // Severity rows count graded findings; `findings` is the all-in
           // total. Report the difference explicitly so the table can never
           // look like it lost findings.
-          const ungraded = '${{ steps.scan.outputs.ungraded-count }}';
+          const ungraded = process.env.SCAN_UNGRADED;
 
           const gradeEmoji = {'A+':'🟢','A':'🟢','B':'🟡','C':'🟠','D':'🔴','F':'🔴'}[grade] || '⚪';
           const noCodeScanned = grade === '?' && score === '0' && findings === '0';
@@ -306,24 +318,25 @@ runs:
 
     - name: Check failure threshold
       shell: bash
-      run: |
-        FAIL_ON="${{ inputs.fail-on }}"
-        CRITICAL="${{ steps.scan.outputs.critical-count }}"
-        HIGH="${{ steps.scan.outputs.high-count }}"
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        CRITICAL: ${{ steps.scan.outputs.critical-count }}
+        HIGH: ${{ steps.scan.outputs.high-count }}
         # The gate counts graded findings only. Vendored/generated/docs
         # findings are reported and uploaded, but a shadcn/ui primitive that
         # ships byte-identically in every project on the platform must not
         # red-line everyone's CI. See packages/shared-rules/src/vendored.ts.
-        FINDINGS="${{ steps.scan.outputs.graded-findings-count }}"
-        UNGRADED="${{ steps.scan.outputs.ungraded-count }}"
-
+        FINDINGS: ${{ steps.scan.outputs.graded-findings-count }}
+        UNGRADED: ${{ steps.scan.outputs.ungraded-count }}
         # Quality findings gate only when asked, and independently of fail-on.
         # They are a different question from "is this safe to ship", so they get
         # their own switch rather than riding on the security threshold — and
         # this check runs even when fail-on is `none`, because opting into one
         # is not opting into the other.
-        QUALITY_HIGH="${{ steps.scan.outputs.quality-high-count }}"
-        if [ "${{ inputs.fail-on-quality }}" = "true" ] && [ "${QUALITY_HIGH:-0}" -gt 0 ] 2>/dev/null; then
+        QUALITY_HIGH: ${{ steps.scan.outputs.quality-high-count }}
+        FAIL_ON_QUALITY: ${{ inputs.fail-on-quality }}
+      run: |
+        if [ "$FAIL_ON_QUALITY" = "true" ] && [ "${QUALITY_HIGH:-0}" -gt 0 ] 2>/dev/null; then
           echo "XploitScan: $QUALITY_HIGH high-severity code-quality finding(s) and fail-on-quality is set. Failing."
           exit 1
         fi
