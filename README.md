@@ -69,7 +69,7 @@ Generate an API key from any paid plan at **xploitscan.com → Settings → API 
 | Output | Description |
 |--------|-------------|
 | `grade` | Security grade (A+ to F) |
-| `score` | Security score (0-100) |
+| `score` | Security score (0-100). At most 3 findings of any one rule are deducted (entropy is one rule, not one per line); the severity counts below are the real totals. Letter caps use those same capped counts. |
 | `findings-count` | Total number of findings, including ones not counted toward the grade |
 | `graded-findings-count` | Findings that count toward the grade (excludes vendored/generated/documentation files). Includes info findings, which never fail the build. |
 | `ungraded-count` | Findings in vendored, generated, or documentation files. Reported and uploaded in the SARIF, but not counted toward the grade or the failure threshold. |

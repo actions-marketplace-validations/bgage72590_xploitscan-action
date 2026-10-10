@@ -140,10 +140,6 @@ runs:
             const gradeVendored = process.env.INPUT_GRADE_VENDORED === 'true';
             const f = gradeVendored ? all : all.filter(x => !x.vendored);
             const ungraded = all.length - f.length;
-            const critical = f.filter(x => x.severity === 'critical').length;
-            const high = f.filter(x => x.severity === 'high').length;
-            const medium = f.filter(x => x.severity === 'medium').length;
-            const low = f.filter(x => x.severity === 'low').length;
             const total = all.length;
             const gradedTotal = f.length;
             const files = j.filesScanned || 0;
@@ -153,20 +149,73 @@ runs:
             // summary can mention them and fail-on-quality can act on them.
             const quality = j.quality || [];
             const qualityHigh = quality.filter(x => x.severity === 'critical' || x.severity === 'high').length;
-            // Scoring matches the web dashboard modal and the CLI calculateGrade function.
-            // Keep all three in sync — changing one without the others will produce
-            // inconsistent grades between CI, terminal, and the web UI.
-            const score = Math.max(0, 100 - (critical * 15) - (high * 7) - (medium * 3) - (low * 1));
-            let grade = score >= 97 ? 'A+' : score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
-            // Severity caps — a scan with serious findings cannot earn a clean grade
-            // regardless of score math.
-            const order = ['A+', 'A', 'B', 'C', 'D', 'F'];
-            const capTo = (cap) => { if (order.indexOf(grade) < order.indexOf(cap)) grade = cap; };
-            if (critical >= 1) capTo('D');
-            else if (high >= 3) capTo('D');
-            else if (high >= 1) capTo('B');
-            else if (medium >= 5) capTo('B');
-            else if (medium >= 1) capTo('A');
+            // GRADE_FN_START
+            // Scoring matches calculateGrade in packages/shared-rules/src/rules.ts
+            // and the dashboard scoring modal. At most 3 findings of one rule
+            // count toward the score and the severity caps (the most severe
+            // ones). ENTROPY groups by rule name, not the per-line id. The
+            // counts returned here are the raw graded totals, for the PR table
+            // and the fail-on gate. Grade and score use the capped totals.
+            // Keep all three surfaces in sync.
+            function gradeFromFindings(findings) {
+              var RULE_CAP = 3;
+              var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+              function ruleFamily(item) {
+                var rule = String(item.rule || '').trim();
+                if (rule === 'ENTROPY' || rule.indexOf('ENTROPY-') === 0) return 'ENTROPY';
+                if (rule) return rule;
+                var id = String(item.id || '');
+                if (id === 'ENTROPY' || id.indexOf('ENTROPY-') === 0) return 'ENTROPY';
+                return id || 'unknown';
+              }
+              var groups = new Map();
+              for (var i = 0; i < findings.length; i++) {
+                var item = findings[i];
+                var key = ruleFamily(item);
+                var bucket = groups.get(key);
+                if (bucket) bucket.push({ item: item, i: i });
+                else groups.set(key, [{ item: item, i: i }]);
+              }
+              var capped = [];
+              groups.forEach(function (bucket) {
+                var ranked = bucket;
+                if (bucket.length > RULE_CAP) {
+                  ranked = bucket.slice().sort(function (a, b) {
+                    var d = (SEV_RANK[b.item.severity] || 0) - (SEV_RANK[a.item.severity] || 0);
+                    return d !== 0 ? d : a.i - b.i;
+                  }).slice(0, RULE_CAP);
+                }
+                for (var j = 0; j < ranked.length; j++) capped.push(ranked[j].item);
+              });
+              function tally(list) {
+                return {
+                  critical: list.filter(function (x) { return x.severity === 'critical'; }).length,
+                  high: list.filter(function (x) { return x.severity === 'high'; }).length,
+                  medium: list.filter(function (x) { return x.severity === 'medium'; }).length,
+                  low: list.filter(function (x) { return x.severity === 'low'; }).length,
+                };
+              }
+              var raw = tally(findings);
+              var counted = tally(capped);
+              var score = Math.max(0, 100 - (counted.critical * 15) - (counted.high * 7) - (counted.medium * 3) - (counted.low * 1));
+              var grade = score >= 97 ? 'A+' : score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
+              var order = ['A+', 'A', 'B', 'C', 'D', 'F'];
+              function capTo(cap) { if (order.indexOf(grade) < order.indexOf(cap)) grade = cap; }
+              if (counted.critical >= 1) capTo('D');
+              else if (counted.high >= 3) capTo('D');
+              else if (counted.high >= 1) capTo('B');
+              else if (counted.medium >= 5) capTo('B');
+              else if (counted.medium >= 1) capTo('A');
+              return { grade: grade, score: score, critical: raw.critical, high: raw.high, medium: raw.medium, low: raw.low };
+            }
+            // GRADE_FN_END
+            const graded = gradeFromFindings(f);
+            const critical = graded.critical;
+            const high = graded.high;
+            const medium = graded.medium;
+            const low = graded.low;
+            const score = graded.score;
+            const grade = graded.grade;
             console.log('GRADE=' + grade);
             console.log('SCORE=' + score);
             console.log('FINDINGS=' + total);
