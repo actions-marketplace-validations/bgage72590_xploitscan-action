@@ -39,6 +39,8 @@ jobs:
           fail-on: critical
 ```
 
+`@v1` tracks the latest v1 release. Pin the action to a full commit SHA so a moved tag cannot change what runs: `uses: bgage72590/xploitscan-action@<full-sha> # v1.6.0`.
+
 ### With an API key from any paid plan (full 223-rule set)
 
 ```yaml
@@ -83,7 +85,7 @@ Generate an API key from any paid plan at **xploitscan.com → Settings → API 
 
 ## What it does
 
-1. Installs and runs `xploitscan` against your codebase.
+1. Installs the exact `xploitscan` release named by `XPLOITSCAN_CLI_VERSION` in `action.yml` (one line) and runs that binary for every scan.
 2. Uploads SARIF results to the GitHub Security tab (findings appear as annotations on changed files in the PR).
 3. Posts a security summary comment on pull requests — updates in place on subsequent pushes so you never get comment spam.
 4. Optionally fails the check if findings exceed your `fail-on` threshold.
@@ -103,11 +105,7 @@ When code changes are detected:
 > | 🟡 Medium | 2 |
 > | 🔵 Low | 0 |
 
-When no scannable code is found (config/docs-only PRs), the comment self-reports instead of falsely green-lighting the PR:
-
-> ## ⚪ XploitScan Security Report
->
-> **No scannable code found in this PR.** This PR may only contain config, docs, or text changes.
+If the CLI crashes, or the JSON report is missing, empty, or not a scan result, the job fails with an `::error::` annotation. A normal scan still passes or fails only from `fail-on` (exit 1 from the CLI means findings over its own critical/high threshold, not a crash).
 
 ## Supported languages
 
@@ -117,11 +115,11 @@ If you run a polyglot repo, the action will still scan and skip files it doesn't
 
 ## Pinning the action version
 
-Pin to a major (`@v1`) to get non-breaking updates automatically, or pin to a specific tag (`@v1.5.0`) if your security policy requires exact-version pinning:
+`@v1` tracks the latest v1 release, and a tag can be moved. Pin the action to a full commit SHA:
 
 ```yaml
-- uses: bgage72590/xploitscan-action@v1       # latest v1.x
-- uses: bgage72590/xploitscan-action@v1.5.0   # exact pin
+- uses: bgage72590/xploitscan-action@v1 # floating v1
+- uses: bgage72590/xploitscan-action@<full-sha> # v1.6.0
 ```
 
 ## Links

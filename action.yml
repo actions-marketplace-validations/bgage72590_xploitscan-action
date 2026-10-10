@@ -100,19 +100,30 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_GRADE_VENDORED: ${{ inputs.grade-vendored }}
         INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
+        # One exact CLI release. A later bump changes this line only; the
+        # install and every scan below read the variable. Do not put a
+        # semver range here.
+        XPLOITSCAN_CLI_VERSION: "1.17.0"
       run: |
-        # Install xploitscan. Belt-and-suspenders fallback chain:
-        #   1) Try `npm install -g` — fastest path when the runner allows
-        #      global installs.
-        #   2) Fall back to `npx --yes` which installs to a temp prefix
-        #      (works even when global install is restricted).
-        #   3) Trailing `|| true` swallows any residual error — a broken
-        #      published CLI (like the workspace:* spec incident on 1.0.16)
-        #      must never block a customer's CI. The scan commands below
-        #      already `|| true` their own failures; this keeps the install
-        #      stage consistent so `bash -e` can't kill the whole step
-        #      before the scan commands get a chance to run.
-        npm install -g xploitscan@^1.0.0 2>/dev/null || npx --yes xploitscan@^1.0.0 --version 2>/dev/null || true
+        # Install once into a temp prefix and reuse that binary. A failed
+        # install fails the job. Swallowing it used to let the rest of the
+        # step pass with no scan at all.
+        if ! printf '%s' "$XPLOITSCAN_CLI_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::XploitScan: XPLOITSCAN_CLI_VERSION must be an exact x.y.z release (got '${XPLOITSCAN_CLI_VERSION}')."
+          exit 1
+        fi
+        PREFIX="${RUNNER_TEMP:-/tmp}/xploitscan-cli"
+        rm -rf "$PREFIX"
+        mkdir -p "$PREFIX"
+        if ! npm install --prefix "$PREFIX" --no-audit --no-fund --omit=dev "xploitscan@${XPLOITSCAN_CLI_VERSION}"; then
+          echo "::error::XploitScan: failed to install xploitscan@${XPLOITSCAN_CLI_VERSION}."
+          exit 1
+        fi
+        CLI="$PREFIX/node_modules/.bin/xploitscan"
+        if [ ! -x "$CLI" ]; then
+          echo "::error::XploitScan: xploitscan@${XPLOITSCAN_CLI_VERSION} installed but the binary is missing at ${CLI}."
+          exit 1
+        fi
 
         # If an Anthropic key is provided, let the CLI run its AI false-positive filter.
         # Otherwise skip the AI path entirely (matches prior behavior).
@@ -122,16 +133,27 @@ runs:
           AI_FLAG="--no-ai"
         fi
 
-        # Run scan with JSON output to a temp file (exit code 1 = findings found, not an error)
+        # JSON scan. CLI exit 0 is a clean scan. Exit 1 is the findings
+        # code (critical/high, or quality when --fail-on-quality is on) —
+        # see packages/cli/src/commands/scan.ts. Any other exit is a crash.
+        # assert-scan-output.js also rejects a missing, empty, or unusable
+        # report so a crash cannot sail through fail-on as zero findings.
         SCAN_JSON=$(mktemp)
-        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" --format json $AI_FLAG 1>"$SCAN_JSON" 2>/dev/null || true
+        export SCAN_JSON
+        SCAN_ERR=$(mktemp)
+        SCAN_STATUS=0
+        "$CLI" scan "$INPUT_PATH" --format json $AI_FLAG >"$SCAN_JSON" 2>"$SCAN_ERR" || SCAN_STATUS=$?
+        if [ -s "$SCAN_ERR" ]; then
+          cat "$SCAN_ERR" >&2
+        fi
+        node "$GITHUB_ACTION_PATH/assert-scan-output.js" "$SCAN_STATUS" "$SCAN_JSON"
 
         # Parse results. Current CLI JSON includes grade and score; recompute
         # anyway so a published CLI that predates those fields still grades
         # the same way, and so testFile / vendored holdouts stay in this gate.
         eval "$(node -e "
           try {
-            const j = JSON.parse(require('fs').readFileSync('$SCAN_JSON', 'utf8'));
+            const j = JSON.parse(require('fs').readFileSync(process.env.SCAN_JSON, 'utf8'));
             const all = j.findings || [];
             // Findings the CLI flagged as vendored (shadcn/ui primitives under
             // components/ui, .md docs, __generated__ output) are reported but
@@ -238,17 +260,8 @@ runs:
             console.log('QUALITY=' + quality.length);
             console.log('QUALITY_HIGH=' + qualityHigh);
           } catch(e) {
-            console.log('GRADE=?');
-            console.log('SCORE=0');
-            console.log('FINDINGS=0');
-            console.log('GRADED_FINDINGS=0');
-            console.log('CRITICAL=0');
-            console.log('HIGH=0');
-            console.log('MEDIUM=0');
-            console.log('LOW=0');
-            console.log('UNGRADED=0');
-            console.log('QUALITY=0');
-            console.log('QUALITY_HIGH=0');
+            console.error('::error::XploitScan: could not grade the scan JSON (' + (e && e.message ? e.message : e) + ').');
+            process.exit(1);
           }
         ")"
         rm -f "$SCAN_JSON"
@@ -266,11 +279,17 @@ runs:
         echo "ungraded-count=$UNGRADED" >> $GITHUB_OUTPUT
         echo "sarif-file=$INPUT_SARIF_FILE" >> $GITHUB_OUTPUT
 
-        # Generate SARIF output (exit code 1 = findings found, not an error)
-        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" --format sarif $AI_FLAG > "$INPUT_SARIF_FILE" 2>/dev/null || true
-        # If SARIF file is empty or doesn't exist, write a valid empty SARIF
+        # SARIF. Exit 1 is findings, same as the JSON scan. A crash fails
+        # the job. An empty file after a normal exit still becomes a valid
+        # empty SARIF so the upload step has something to send.
+        SARIF_STATUS=0
+        "$CLI" scan "$INPUT_PATH" --format sarif $AI_FLAG >"$INPUT_SARIF_FILE" 2>>"$SCAN_ERR" || SARIF_STATUS=$?
+        if [ "$SARIF_STATUS" -ne 0 ] && [ "$SARIF_STATUS" -ne 1 ]; then
+          echo "::error::XploitScan CLI crashed while writing SARIF (exit ${SARIF_STATUS}). Exit 1 means findings over the CLI threshold and is not a crash."
+          exit 1
+        fi
         if [ ! -s "$INPUT_SARIF_FILE" ]; then
-          echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"XploitScan","version":"1.0.0","rules":[]}},"results":[]}]}' > "$INPUT_SARIF_FILE"
+          printf '%s\n' "{\"version\":\"2.1.0\",\"\$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"XploitScan\",\"version\":\"${XPLOITSCAN_CLI_VERSION}\",\"rules\":[]}},\"results\":[]}]}" > "$INPUT_SARIF_FILE"
         fi
 
         # Print summary
@@ -283,8 +302,13 @@ runs:
         fi
         echo "================================="
 
-        # Also run terminal output for readable logs (exit code 1 = findings, not error)
-        npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" $AI_FLAG 2>&1 || true
+        # Terminal output for the job log. Exit 1 is findings, not a crash.
+        TERM_STATUS=0
+        "$CLI" scan "$INPUT_PATH" $AI_FLAG || TERM_STATUS=$?
+        if [ "$TERM_STATUS" -ne 0 ] && [ "$TERM_STATUS" -ne 1 ]; then
+          echo "::error::XploitScan CLI crashed while printing the terminal report (exit ${TERM_STATUS}). Exit 1 means findings over the CLI threshold and is not a crash."
+          exit 1
+        fi
 
     - name: Upload SARIF to GitHub Security
       if: hashFiles(inputs.sarif-file) != ''
