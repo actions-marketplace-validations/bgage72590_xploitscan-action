@@ -126,7 +126,9 @@ runs:
         SCAN_JSON=$(mktemp)
         npx --yes xploitscan@^1.0.0 scan "$INPUT_PATH" --format json $AI_FLAG 1>"$SCAN_JSON" 2>/dev/null || true
 
-        # Parse results — compute grade/score/counts from findings since CLI JSON doesn't include them
+        # Parse results. Current CLI JSON includes grade and score; recompute
+        # anyway so a published CLI that predates those fields still grades
+        # the same way, and so testFile / vendored holdouts stay in this gate.
         eval "$(node -e "
           try {
             const j = JSON.parse(require('fs').readFileSync('$SCAN_JSON', 'utf8'));
@@ -138,7 +140,10 @@ runs:
             // the platform ships byte-identically. They stay in FINDINGS and
             // in the SARIF upload; only the grade and the gate skip them.
             const gradeVendored = process.env.INPUT_GRADE_VENDORED === 'true';
-            const f = gradeVendored ? all : all.filter(x => !x.vendored);
+            // Test and fixture files are held out even when grade-vendored is
+            // on. The CLI stamps testFile; this gate trusts it the same way
+            // it trusts vendored. A test-file secret is not graded.
+            const f = all.filter(x => !x.testFile && (gradeVendored || !x.vendored));
             const ungraded = all.length - f.length;
             const total = all.length;
             const gradedTotal = f.length;
@@ -156,15 +161,20 @@ runs:
             // ones). ENTROPY groups by rule name, not the per-line id. The
             // counts returned here are the raw graded totals, for the PR table
             // and the fail-on gate. Grade and score use the capped totals.
-            // Keep all three surfaces in sync.
+            // Dependency advisories (GHSA, CVE, OSV, DEP) are one family,
+            // like ENTROPY. Keep all three surfaces in sync.
             function gradeFromFindings(findings) {
               var RULE_CAP = 3;
               var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+              function isAdvisory(value) {
+                return /^(?:GHSA-|CVE-\d|OSV-|DEP\d)/i.test(value);
+              }
               function ruleFamily(item) {
                 var rule = String(item.rule || '').trim();
+                var id = String(item.id || '');
+                if (isAdvisory(rule) || isAdvisory(id)) return 'ADVISORY';
                 if (rule === 'ENTROPY' || rule.indexOf('ENTROPY-') === 0) return 'ENTROPY';
                 if (rule) return rule;
-                var id = String(item.id || '');
                 if (id === 'ENTROPY' || id.indexOf('ENTROPY-') === 0) return 'ENTROPY';
                 return id || 'unknown';
               }
@@ -269,7 +279,7 @@ runs:
         echo "XploitScan Results: Grade $GRADE ($SCORE/100)"
         echo "Findings: $FINDINGS total, $GRADED_FINDINGS graded (Critical: $CRITICAL, High: $HIGH, Medium: $MEDIUM, Low: $LOW)"
         if [ "${UNGRADED:-0}" -gt 0 ] 2>/dev/null; then
-          echo "Not graded: $UNGRADED finding(s) in vendored, generated, or documentation files"
+          echo "Not graded: $UNGRADED finding(s) in vendored, generated, documentation, or test files"
         fi
         echo "================================="
 
@@ -323,7 +333,7 @@ runs:
             `## ${gradeEmoji} XploitScan Security Report`,
             ``,
             `**Grade: ${grade}** | Score: ${score}/100 | ${findings} finding${findings === '1' ? '' : 's'}`,
-            ...(Number(ungraded) > 0 ? [``, `> ${ungraded} finding${ungraded === '1' ? '' : 's'} in vendored, generated, or documentation files ${ungraded === '1' ? 'is' : 'are'} in the Security tab but ${ungraded === '1' ? 'is' : 'are'} not counted in the grade or the table below.`] : []),
+            ...(Number(ungraded) > 0 ? [``, `> ${ungraded} finding${ungraded === '1' ? '' : 's'} in vendored, generated, documentation, or test files ${ungraded === '1' ? 'is' : 'are'} in the Security tab but ${ungraded === '1' ? 'is' : 'are'} not counted in the grade or the table below.`] : []),
             ``,
             `| Severity | Count |`,
             `|----------|-------|`,

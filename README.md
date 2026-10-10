@@ -61,7 +61,7 @@ Generate an API key from any paid plan at **xploitscan.com → Settings → API 
 | `comment` | Post a summary comment on pull requests (default: true) | `true` |
 | `api-key` | XploitScan API key (xpls_...) — generate one in Settings → API Keys. Required to unlock the full 223-rule Pro set; without it the action runs the 30 free rules. | `''` |
 | `fail-on-quality` | Also fail the action on high-severity code-quality findings (QA…). Off by default: quality findings are reported either way, and the exit code is a contract with pipelines that were passing before they existed. See https://xploitscan.com/quality | `false` |
-| `grade-vendored` | Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain. NOTE: this input is what the action grades by; `scan.gradeVendored` in .xploitscanrc does not apply here, because the action recomputes the grade from the scan JSON rather than using the CLI's. | `false` |
+| `grade-vendored` | Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain. Test and fixture files stay out of the grade either way. NOTE: this input is what the action grades by; `scan.gradeVendored` in .xploitscanrc does not apply here, because the action recomputes the grade from the scan JSON rather than using the CLI's. | `false` |
 | `anthropic-api-key` | Optional Anthropic API key. When set, findings are run through XploitScan's AI false-positive filter (uses Claude Haiku, ~$0.01 per scan). Reduces noise on CI runs. Get one at https://console.anthropic.com. | `''` |
 
 ## Outputs
@@ -69,10 +69,10 @@ Generate an API key from any paid plan at **xploitscan.com → Settings → API 
 | Output | Description |
 |--------|-------------|
 | `grade` | Security grade (A+ to F) |
-| `score` | Security score (0-100). At most 3 findings of any one rule are deducted (entropy is one rule, not one per line); the severity counts below are the real totals. Letter caps use those same capped counts. |
+| `score` | Security score (0-100). At most 3 findings of any one rule are deducted. Entropy is one rule, not one per line, and dependency advisories (GHSA, CVE, OSV, DEP) are one rule as well. The severity counts below are the real totals. Letter caps use those same capped counts. |
 | `findings-count` | Total number of findings, including ones not counted toward the grade |
-| `graded-findings-count` | Findings that count toward the grade (excludes vendored/generated/documentation files). Includes info findings, which never fail the build. |
-| `ungraded-count` | Findings in vendored, generated, or documentation files. Reported and uploaded in the SARIF, but not counted toward the grade or the failure threshold. |
+| `graded-findings-count` | Findings that count toward the grade (excludes vendored, generated, documentation, and test files). Includes info findings, which never fail the build. |
+| `ungraded-count` | Findings in vendored, generated, documentation, or test files. Reported and uploaded in the SARIF, but not counted toward the grade or the failure threshold. A live provider key in a test file is still graded and is not included here. Dependency advisories (GHSA, CVE, OSV, DEP) count as one rule toward the score, the same way entropy does. |
 | `quality-count` | Code-quality findings (QA…). Never counted toward the grade or the severity counts; see fail-on-quality. |
 | `quality-high-count` | Code-quality findings at high severity or above. |
 | `critical-count` | Number of critical findings |
