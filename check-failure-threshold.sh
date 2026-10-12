@@ -33,8 +33,13 @@ if [ "${FAIL_ON}" != "none" ]; then
   require_int() {
     local name="$1"
     local raw="$2"
-    local val="${raw:-0}"
-    if ! [[ "${val}" =~ ^[0-9]+$ ]]; then
+    # Empty must not become 0 — that is how a crashed grader used to
+    # fail-open every fail-on threshold.
+    if [ -z "${raw}" ]; then
+      echo "::error::XploitScan: ${name} is empty (grader did not produce a count). Refusing to fail-open."
+      exit 2
+    fi
+    if ! [[ "${raw}" =~ ^[0-9]+$ ]]; then
       echo "::error::XploitScan: ${name} must be a non-negative integer (got '${raw}')."
       exit 2
     fi
