@@ -39,7 +39,7 @@ jobs:
           fail-on: critical
 ```
 
-`@v1` tracks the latest v1 release. Pin the action to a full commit SHA so a moved tag cannot change what runs: `uses: bgage72590/xploitscan-action@<full-sha> # v1.6.0`.
+`@v1` tracks the latest v1 release. Pin the action to a full commit SHA so a moved tag cannot change what runs: `uses: bgage72590/xploitscan-action@7ceb7e2af3f7dc6e736dc46b17b8736f5978a4bc # v1.9.0`.
 
 ### With an API key from any paid plan (full 223-rule set)
 
@@ -119,7 +119,7 @@ If you run a polyglot repo, the action will still scan and skip files it doesn't
 
 ```yaml
 - uses: bgage72590/xploitscan-action@v1 # floating v1
-- uses: bgage72590/xploitscan-action@<full-sha> # v1.6.0
+- uses: bgage72590/xploitscan-action@7ceb7e2af3f7dc6e736dc46b17b8736f5978a4bc # v1.9.0
 ```
 
 ## Links
