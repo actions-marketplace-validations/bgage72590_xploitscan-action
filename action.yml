@@ -18,6 +18,10 @@ inputs:
     description: 'Path to write SARIF output (default: xploitscan-results.sarif)'
     required: false
     default: 'xploitscan-results.sarif'
+  upload-sarif:
+    description: 'Upload the SARIF file to GitHub code scanning (the Security tab) (default: true). Set to false on private repositories without GitHub Code Security, or to keep results out of the Security tab. The SARIF file is still written to sarif-file either way.'
+    required: false
+    default: 'true'
   comment:
     description: 'Post a summary comment on pull requests (default: true)'
     required: false
@@ -334,7 +338,7 @@ runs:
         fi
 
     - name: Upload SARIF to GitHub Security
-      if: hashFiles(inputs.sarif-file) != ''
+      if: inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-file) != ''
       uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3.39.0
       with:
         sarif_file: ${{ inputs.sarif-file }}

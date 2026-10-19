@@ -60,6 +60,7 @@ Generate an API key from any paid plan at **xploitscan.com → Settings → API 
 | `path` | Path to scan (default: current directory) | `.` |
 | `fail-on` | Fail the action if graded findings (critical, high, medium, low — not info) of this severity or higher are found: critical, high, medium, low, none (default: none) | `none` |
 | `sarif-file` | Path to write SARIF output (default: xploitscan-results.sarif) | `xploitscan-results.sarif` |
+| `upload-sarif` | Upload the SARIF file to GitHub code scanning (the Security tab). Set to `false` on private repositories without GitHub Code Security; the SARIF file is still written to `sarif-file`. | `true` |
 | `comment` | Post a summary comment on pull requests (default: true) | `true` |
 | `api-key` | XploitScan API key (xpls_...) — generate one in Settings → API Keys. Required to unlock the full 223-rule Pro set; without it the action runs the 30 free rules. | `''` |
 | `fail-on-quality` | Also fail the action on high-severity code-quality findings (QA…). Off by default: quality findings are reported either way, and the exit code is a contract with pipelines that were passing before they existed. See https://xploitscan.com/quality | `false` |
