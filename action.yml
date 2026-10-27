@@ -1,5 +1,5 @@
 name: 'XploitScan Security Scanner'
-description: 'Security scanner for AI-generated code. 30 core rules (210+ with Pro). Outputs SARIF for GitHub Security tab.'
+description: 'Security scanner for AI-generated code. 30 core rules (223 with Pro). Outputs SARIF for GitHub Security tab.'
 author: 'Cipherline LLC'
 branding:
   icon: 'shield'
@@ -11,23 +11,31 @@ inputs:
     required: false
     default: '.'
   fail-on:
-    description: 'Fail the action if findings of this severity or higher are found: critical, high, medium, low, none (default: none)'
+    description: 'Fail the action if graded findings (critical, high, medium, low — not info) of this severity or higher are found: critical, high, medium, low, none (default: none)'
     required: false
     default: 'none'
   sarif-file:
     description: 'Path to write SARIF output (default: xploitscan-results.sarif)'
     required: false
     default: 'xploitscan-results.sarif'
+  upload-sarif:
+    description: 'Upload the SARIF file to GitHub code scanning (the Security tab) (default: true). Set to false on private repositories without GitHub Code Security, or to keep results out of the Security tab. The SARIF file is still written to sarif-file either way.'
+    required: false
+    default: 'true'
   comment:
     description: 'Post a summary comment on pull requests (default: true)'
     required: false
     default: 'true'
   api-key:
-    description: 'XploitScan API key (xpls_...) — generate one in Settings → API Keys. Required to unlock the full 210+ rule Pro set; without it the action runs the 30 free rules.'
+    description: 'XploitScan API key (xpls_...) — generate one in Settings → API Keys. Required to unlock the full 223-rule Pro set; without it the action runs the 30 free rules.'
     required: false
     default: ''
+  fail-on-quality:
+    description: 'Also fail the action on high-severity code-quality findings (QA…). Off by default: quality findings are reported either way, and the exit code is a contract with pipelines that were passing before they existed. See https://xploitscan.com/quality'
+    required: false
+    default: 'false'
   grade-vendored:
-    description: 'Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain.'
+    description: 'Count findings in vendored, generated, and documentation files (components/ui, __generated__, *.md) toward the grade and the failure threshold. Off by default — those findings are reported and uploaded to the Security tab either way. Set to true if you treat vendored code as yours to maintain. NOTE: this input is what the action grades by; `scan.gradeVendored` in .xploitscanrc does not apply here, because the action recomputes the grade from the scan JSON rather than using the CLI''s.'
     required: false
     default: 'false'
   anthropic-api-key:
@@ -52,11 +60,17 @@ outputs:
     description: 'Total number of findings, including ones not counted toward the grade'
     value: ${{ steps.scan.outputs.findings-count }}
   graded-findings-count:
-    description: 'Findings that count toward the grade and the failure threshold (excludes vendored/generated/documentation files)'
+    description: 'Findings that count toward the grade (excludes vendored/generated/documentation files). Includes info findings, which never fail the build.'
     value: ${{ steps.scan.outputs.graded-findings-count }}
   ungraded-count:
     description: 'Findings in vendored, generated, or documentation files. Reported and uploaded in the SARIF, but not counted toward the grade or the failure threshold.'
     value: ${{ steps.scan.outputs.ungraded-count }}
+  quality-count:
+    description: 'Code-quality findings (QA…). Never counted toward the grade or the severity counts; see fail-on-quality.'
+    value: ${{ steps.scan.outputs.quality-count }}
+  quality-high-count:
+    description: 'Code-quality findings at high severity or above.'
+    value: ${{ steps.scan.outputs.quality-high-count }}
   critical-count:
     description: 'Number of critical findings'
     value: ${{ steps.scan.outputs.critical-count }}
@@ -77,9 +91,10 @@ runs:
   using: 'composite'
   steps:
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: '22'
+        check-latest: true
 
     - name: Run XploitScan
       id: scan
@@ -87,19 +102,33 @@ runs:
       env:
         XPLOITSCAN_API_KEY: ${{ inputs.api-key }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_GRADE_VENDORED: ${{ inputs.grade-vendored }}
+        INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
+        # One exact CLI release. A later bump changes this line only; the
+        # install and every scan below read the variable. Do not put a
+        # semver range here.
+        XPLOITSCAN_CLI_VERSION: "1.18.14"
       run: |
-        # Install xploitscan. Belt-and-suspenders fallback chain:
-        #   1) Try `npm install -g` — fastest path when the runner allows
-        #      global installs.
-        #   2) Fall back to `npx --yes` which installs to a temp prefix
-        #      (works even when global install is restricted).
-        #   3) Trailing `|| true` swallows any residual error — a broken
-        #      published CLI (like the workspace:* spec incident on 1.0.16)
-        #      must never block a customer's CI. The scan commands below
-        #      already `|| true` their own failures; this keeps the install
-        #      stage consistent so `bash -e` can't kill the whole step
-        #      before the scan commands get a chance to run.
-        npm install -g xploitscan@^1.0.0 2>/dev/null || npx --yes xploitscan@^1.0.0 --version 2>/dev/null || true
+        # Install once into a temp prefix and reuse that binary. A failed
+        # install fails the job. Swallowing it used to let the rest of the
+        # step pass with no scan at all.
+        if ! printf '%s' "$XPLOITSCAN_CLI_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::XploitScan: XPLOITSCAN_CLI_VERSION must be an exact x.y.z release (got '${XPLOITSCAN_CLI_VERSION}')."
+          exit 1
+        fi
+        PREFIX="${RUNNER_TEMP:-/tmp}/xploitscan-cli"
+        rm -rf "$PREFIX"
+        mkdir -p "$PREFIX"
+        if ! npm install --prefix "$PREFIX" --no-audit --no-fund --omit=dev "xploitscan@${XPLOITSCAN_CLI_VERSION}"; then
+          echo "::error::XploitScan: failed to install xploitscan@${XPLOITSCAN_CLI_VERSION}."
+          exit 1
+        fi
+        CLI="$PREFIX/node_modules/.bin/xploitscan"
+        if [ ! -x "$CLI" ]; then
+          echo "::error::XploitScan: xploitscan@${XPLOITSCAN_CLI_VERSION} installed but the binary is missing at ${CLI}."
+          exit 1
+        fi
 
         # If an Anthropic key is provided, let the CLI run its AI false-positive filter.
         # Otherwise skip the AI path entirely (matches prior behavior).
@@ -109,14 +138,33 @@ runs:
           AI_FLAG="--no-ai"
         fi
 
-        # Run scan with JSON output to a temp file (exit code 1 = findings found, not an error)
+        # JSON scan. CLI exit 0 is a clean scan. Exit 1 is the findings
+        # code (critical/high, or quality when --fail-on-quality is on) —
+        # see packages/cli/src/commands/scan.ts. Any other exit is a crash.
+        # assert-scan-output.js also rejects a missing, empty, or unusable
+        # report so a crash cannot sail through fail-on as zero findings.
         SCAN_JSON=$(mktemp)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" --format json $AI_FLAG 1>"$SCAN_JSON" 2>/dev/null || true
+        export SCAN_JSON
+        SCAN_ERR=$(mktemp)
+        SCAN_STATUS=0
+        "$CLI" scan "$INPUT_PATH" --format json $AI_FLAG >"$SCAN_JSON" 2>"$SCAN_ERR" || SCAN_STATUS=$?
+        if [ -s "$SCAN_ERR" ]; then
+          cat "$SCAN_ERR" >&2
+        fi
+        node "$GITHUB_ACTION_PATH/assert-scan-output.js" "$SCAN_STATUS" "$SCAN_JSON"
 
-        # Parse results — compute grade/score/counts from findings since CLI JSON doesn't include them
-        eval "$(node -e "
+        # Parse results. Current CLI JSON includes grade and score; recompute
+        # anyway so a published CLI that predates those fields still grades
+        # the same way, and so testFile / vendored holdouts stay in this gate.
+        #
+        # Fail closed: `eval "$(node …)"` swallows a non-zero node exit under
+        # bash -e (command substitution), so a crashed grader used to leave
+        # CRITICAL/HIGH empty and the fail-on gate treated them as 0. Capture
+        # status first, then eval, then require GRADE.
+        set +e
+        GRADE_ENV=$(node -e "
           try {
-            const j = JSON.parse(require('fs').readFileSync('$SCAN_JSON', 'utf8'));
+            const j = JSON.parse(require('fs').readFileSync(process.env.SCAN_JSON, 'utf8'));
             const all = j.findings || [];
             // Findings the CLI flagged as vendored (shadcn/ui primitives under
             // components/ui, .md docs, __generated__ output) are reported but
@@ -124,30 +172,93 @@ runs:
             // them here would red-line CI on scaffold code every project on
             // the platform ships byte-identically. They stay in FINDINGS and
             // in the SARIF upload; only the grade and the gate skip them.
-            const gradeVendored = '${{ inputs.grade-vendored }}' === 'true';
-            const f = gradeVendored ? all : all.filter(x => !x.vendored);
+            const gradeVendored = process.env.INPUT_GRADE_VENDORED === 'true';
+            // Test and fixture files are held out even when grade-vendored is
+            // on. The CLI stamps testFile; this gate trusts it the same way
+            // it trusts vendored. A test-file secret is not graded.
+            const f = all.filter(x => !x.testFile && (gradeVendored || !x.vendored));
             const ungraded = all.length - f.length;
-            const critical = f.filter(x => x.severity === 'critical').length;
-            const high = f.filter(x => x.severity === 'high').length;
-            const medium = f.filter(x => x.severity === 'medium').length;
-            const low = f.filter(x => x.severity === 'low').length;
             const total = all.length;
             const gradedTotal = f.length;
             const files = j.filesScanned || 0;
-            // Scoring matches the web dashboard modal and the CLI calculateGrade function.
-            // Keep all three in sync — changing one without the others will produce
-            // inconsistent grades between CI, terminal, and the web UI.
-            const score = Math.max(0, 100 - (critical * 15) - (high * 7) - (medium * 3) - (low * 1));
-            let grade = score >= 97 ? 'A+' : score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
-            // Severity caps — a scan with serious findings cannot earn a clean grade
-            // regardless of score math.
-            const order = ['A+', 'A', 'B', 'C', 'D', 'F'];
-            const capTo = (cap) => { if (order.indexOf(grade) < order.indexOf(cap)) grade = cap; };
-            if (critical >= 1) capTo('D');
-            else if (high >= 3) capTo('D');
-            else if (high >= 1) capTo('B');
-            else if (medium >= 5) capTo('B');
-            else if (medium >= 1) capTo('A');
+            // Quality findings ride in their OWN key and are deliberately
+            // absent from every number above: they do not move the grade, the
+            // severity counts, or the default gate. Counted here only so the
+            // summary can mention them and fail-on-quality can act on them.
+            const quality = j.quality || [];
+            const qualityHigh = quality.filter(x => x.severity === 'critical' || x.severity === 'high').length;
+            // GRADE_FN_START
+            // Scoring matches calculateGrade in packages/shared-rules/src/rules.ts
+            // and the dashboard scoring modal. At most 3 findings of one rule
+            // count toward the score and the severity caps (the most severe
+            // ones). ENTROPY groups by rule name, not the per-line id. The
+            // counts returned here are the raw graded totals, for the PR table
+            // and the fail-on gate. Grade and score use the capped totals.
+            // Dependency advisories (GHSA, CVE, OSV, DEP) are one family,
+            // like ENTROPY. Keep all three surfaces in sync.
+            function gradeFromFindings(findings) {
+              var RULE_CAP = 3;
+              var SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+              function isAdvisory(value) {
+                return /^(?:GHSA-|CVE-\d|OSV-|DEP\d)/i.test(value);
+              }
+              function ruleFamily(item) {
+                var rule = String(item.rule || '').trim();
+                var id = String(item.id || '');
+                if (isAdvisory(rule) || isAdvisory(id)) return 'ADVISORY';
+                if (rule === 'ENTROPY' || rule.indexOf('ENTROPY-') === 0) return 'ENTROPY';
+                if (rule) return rule;
+                if (id === 'ENTROPY' || id.indexOf('ENTROPY-') === 0) return 'ENTROPY';
+                return id || 'unknown';
+              }
+              var groups = new Map();
+              for (var i = 0; i < findings.length; i++) {
+                var item = findings[i];
+                var key = ruleFamily(item);
+                var bucket = groups.get(key);
+                if (bucket) bucket.push({ item: item, i: i });
+                else groups.set(key, [{ item: item, i: i }]);
+              }
+              var capped = [];
+              groups.forEach(function (bucket) {
+                var ranked = bucket;
+                if (bucket.length > RULE_CAP) {
+                  ranked = bucket.slice().sort(function (a, b) {
+                    var d = (SEV_RANK[b.item.severity] || 0) - (SEV_RANK[a.item.severity] || 0);
+                    return d !== 0 ? d : a.i - b.i;
+                  }).slice(0, RULE_CAP);
+                }
+                for (var j = 0; j < ranked.length; j++) capped.push(ranked[j].item);
+              });
+              function tally(list) {
+                return {
+                  critical: list.filter(function (x) { return x.severity === 'critical'; }).length,
+                  high: list.filter(function (x) { return x.severity === 'high'; }).length,
+                  medium: list.filter(function (x) { return x.severity === 'medium'; }).length,
+                  low: list.filter(function (x) { return x.severity === 'low'; }).length,
+                };
+              }
+              var raw = tally(findings);
+              var counted = tally(capped);
+              var score = Math.max(0, 100 - (counted.critical * 15) - (counted.high * 7) - (counted.medium * 3) - (counted.low * 1));
+              var grade = score >= 97 ? 'A+' : score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
+              var order = ['A+', 'A', 'B', 'C', 'D', 'F'];
+              function capTo(cap) { if (order.indexOf(grade) < order.indexOf(cap)) grade = cap; }
+              if (counted.critical >= 1) capTo('D');
+              else if (counted.high >= 3) capTo('D');
+              else if (counted.high >= 1) capTo('B');
+              else if (counted.medium >= 5) capTo('B');
+              else if (counted.medium >= 1) capTo('A');
+              return { grade: grade, score: score, critical: raw.critical, high: raw.high, medium: raw.medium, low: raw.low };
+            }
+            // GRADE_FN_END
+            const graded = gradeFromFindings(f);
+            const critical = graded.critical;
+            const high = graded.high;
+            const medium = graded.medium;
+            const low = graded.low;
+            const score = graded.score;
+            const grade = graded.grade;
             console.log('GRADE=' + grade);
             console.log('SCORE=' + score);
             console.log('FINDINGS=' + total);
@@ -157,20 +268,28 @@ runs:
             console.log('MEDIUM=' + medium);
             console.log('LOW=' + low);
             console.log('UNGRADED=' + ungraded);
+            console.log('QUALITY=' + quality.length);
+            console.log('QUALITY_HIGH=' + qualityHigh);
           } catch(e) {
-            console.log('GRADE=?');
-            console.log('SCORE=0');
-            console.log('FINDINGS=0');
-            console.log('GRADED_FINDINGS=0');
-            console.log('CRITICAL=0');
-            console.log('HIGH=0');
-            console.log('MEDIUM=0');
-            console.log('LOW=0');
-            console.log('UNGRADED=0');
+            console.error('::error::XploitScan: could not grade the scan JSON (' + (e && e.message ? e.message : e) + ').');
+            process.exit(1);
           }
-        ")"
+        ")
+        GRADE_STATUS=$?
+        set -e
+        if [ "$GRADE_STATUS" -ne 0 ]; then
+          echo "::error::XploitScan: grader exited ${GRADE_STATUS}. Refusing to fail-open on missing counts."
+          exit 1
+        fi
+        eval "$GRADE_ENV"
+        if [ -z "${GRADE:-}" ]; then
+          echo "::error::XploitScan: grader produced no GRADE. Refusing to fail-open."
+          exit 1
+        fi
         rm -f "$SCAN_JSON"
 
+        echo "quality-count=$QUALITY" >> $GITHUB_OUTPUT
+        echo "quality-high-count=$QUALITY_HIGH" >> $GITHUB_OUTPUT
         echo "grade=$GRADE" >> $GITHUB_OUTPUT
         echo "score=$SCORE" >> $GITHUB_OUTPUT
         echo "findings-count=$FINDINGS" >> $GITHUB_OUTPUT
@@ -180,13 +299,25 @@ runs:
         echo "medium-count=$MEDIUM" >> $GITHUB_OUTPUT
         echo "low-count=$LOW" >> $GITHUB_OUTPUT
         echo "ungraded-count=$UNGRADED" >> $GITHUB_OUTPUT
-        echo "sarif-file=${{ inputs.sarif-file }}" >> $GITHUB_OUTPUT
+        echo "sarif-file=$INPUT_SARIF_FILE" >> $GITHUB_OUTPUT
 
-        # Generate SARIF output (exit code 1 = findings found, not an error)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" --format sarif $AI_FLAG > "${{ inputs.sarif-file }}" 2>/dev/null || true
-        # If SARIF file is empty or doesn't exist, write a valid empty SARIF
-        if [ ! -s "${{ inputs.sarif-file }}" ]; then
-          echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"XploitScan","version":"1.0.0","rules":[]}},"results":[]}]}' > "${{ inputs.sarif-file }}"
+        # SARIF. Exit 1 is findings, same as the JSON scan. A crash fails
+        # the job. An empty file is only safe to replace with empty SARIF when
+        # the JSON scan truly had 0 findings — otherwise GitHub code scanning
+        # treats the upload as "no results" and closes open alerts.
+        SARIF_STATUS=0
+        "$CLI" scan "$INPUT_PATH" --format sarif $AI_FLAG >"$INPUT_SARIF_FILE" 2>>"$SCAN_ERR" || SARIF_STATUS=$?
+        if [ "$SARIF_STATUS" -ne 0 ] && [ "$SARIF_STATUS" -ne 1 ]; then
+          echo "::error::XploitScan CLI crashed while writing SARIF (exit ${SARIF_STATUS}). Exit 1 means findings over the CLI threshold and is not a crash."
+          exit 1
+        fi
+        if [ ! -s "$INPUT_SARIF_FILE" ]; then
+          if [ "${FINDINGS}" = "0" ]; then
+            printf '%s\n' "{\"version\":\"2.1.0\",\"\$schema\":\"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"XploitScan\",\"version\":\"${XPLOITSCAN_CLI_VERSION}\",\"rules\":[]}},\"results\":[]}]}" > "$INPUT_SARIF_FILE"
+          else
+            echo "::error::XploitScan: SARIF output is empty but the JSON scan reported ${FINDINGS:-unknown} finding(s). Refusing to upload an empty SARIF (that would close open code-scanning alerts)."
+            exit 1
+          fi
         fi
 
         # Print summary
@@ -195,36 +326,50 @@ runs:
         echo "XploitScan Results: Grade $GRADE ($SCORE/100)"
         echo "Findings: $FINDINGS total, $GRADED_FINDINGS graded (Critical: $CRITICAL, High: $HIGH, Medium: $MEDIUM, Low: $LOW)"
         if [ "${UNGRADED:-0}" -gt 0 ] 2>/dev/null; then
-          echo "Not graded: $UNGRADED finding(s) in vendored, generated, or documentation files"
+          echo "Not graded: $UNGRADED finding(s) in vendored, generated, documentation, or test files"
         fi
         echo "================================="
 
-        # Also run terminal output for readable logs (exit code 1 = findings, not error)
-        npx --yes xploitscan@^1.0.0 scan "${{ inputs.path }}" $AI_FLAG 2>&1 || true
+        # Terminal output for the job log. Exit 1 is findings, not a crash.
+        TERM_STATUS=0
+        "$CLI" scan "$INPUT_PATH" $AI_FLAG || TERM_STATUS=$?
+        if [ "$TERM_STATUS" -ne 0 ] && [ "$TERM_STATUS" -ne 1 ]; then
+          echo "::error::XploitScan CLI crashed while printing the terminal report (exit ${TERM_STATUS}). Exit 1 means findings over the CLI threshold and is not a crash."
+          exit 1
+        fi
 
     - name: Upload SARIF to GitHub Security
-      if: hashFiles(inputs.sarif-file) != ''
-      uses: github/codeql-action/upload-sarif@v3
+      if: inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-file) != ''
+      uses: github/codeql-action/upload-sarif@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3.39.0
       with:
         sarif_file: ${{ inputs.sarif-file }}
       continue-on-error: true
 
     - name: Post PR Comment
       if: github.event_name == 'pull_request' && inputs.comment == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+      env:
+        SCAN_GRADE: ${{ steps.scan.outputs.grade }}
+        SCAN_SCORE: ${{ steps.scan.outputs.score }}
+        SCAN_FINDINGS: ${{ steps.scan.outputs.findings-count }}
+        SCAN_CRITICAL: ${{ steps.scan.outputs.critical-count }}
+        SCAN_HIGH: ${{ steps.scan.outputs.high-count }}
+        SCAN_MEDIUM: ${{ steps.scan.outputs.medium-count }}
+        SCAN_LOW: ${{ steps.scan.outputs.low-count }}
+        SCAN_UNGRADED: ${{ steps.scan.outputs.ungraded-count }}
       with:
         script: |
-          const grade = '${{ steps.scan.outputs.grade }}';
-          const score = '${{ steps.scan.outputs.score }}';
-          const findings = '${{ steps.scan.outputs.findings-count }}';
-          const critical = '${{ steps.scan.outputs.critical-count }}';
-          const high = '${{ steps.scan.outputs.high-count }}';
-          const medium = '${{ steps.scan.outputs.medium-count }}';
-          const low = '${{ steps.scan.outputs.low-count }}';
+          const grade = process.env.SCAN_GRADE;
+          const score = process.env.SCAN_SCORE;
+          const findings = process.env.SCAN_FINDINGS;
+          const critical = process.env.SCAN_CRITICAL;
+          const high = process.env.SCAN_HIGH;
+          const medium = process.env.SCAN_MEDIUM;
+          const low = process.env.SCAN_LOW;
           // Severity rows count graded findings; `findings` is the all-in
           // total. Report the difference explicitly so the table can never
           // look like it lost findings.
-          const ungraded = '${{ steps.scan.outputs.ungraded-count }}';
+          const ungraded = process.env.SCAN_UNGRADED;
 
           const gradeEmoji = {'A+':'🟢','A':'🟢','B':'🟡','C':'🟠','D':'🔴','F':'🔴'}[grade] || '⚪';
           const noCodeScanned = grade === '?' && score === '0' && findings === '0';
@@ -235,12 +380,12 @@ runs:
             `> **No scannable code found in this PR.** This PR may only contain config, docs, or text changes. XploitScan analyzes source code files (JS, TS, Python, Go, etc.) — non-code changes are automatically skipped.`,
             ``,
             `---`,
-            `*Scanned with [XploitScan](https://xploitscan.com) — 30 core security rules for AI-generated code (up to 210+ with Pro)*`,
+            `*Scanned with [XploitScan](https://xploitscan.com) — 30 core security rules for AI-generated code (up to 223 with Pro)*`,
           ].join('\n') : [
             `## ${gradeEmoji} XploitScan Security Report`,
             ``,
             `**Grade: ${grade}** | Score: ${score}/100 | ${findings} finding${findings === '1' ? '' : 's'}`,
-            ...(Number(ungraded) > 0 ? [``, `> ${ungraded} finding${ungraded === '1' ? '' : 's'} in vendored, generated, or documentation files ${ungraded === '1' ? 'is' : 'are'} in the Security tab but ${ungraded === '1' ? 'is' : 'are'} not counted in the grade or the table below.`] : []),
+            ...(Number(ungraded) > 0 ? [``, `> ${ungraded} finding${ungraded === '1' ? '' : 's'} in vendored, generated, documentation, or test files ${ungraded === '1' ? 'is' : 'are'} in the Security tab but ${ungraded === '1' ? 'is' : 'are'} not counted in the grade or the table below.`] : []),
             ``,
             `| Severity | Count |`,
             `|----------|-------|`,
@@ -254,7 +399,7 @@ runs:
               : `> Run \`npx xploitscan scan .\` locally for full details with fix suggestions.`,
             ``,
             `---`,
-            `*Scanned with [XploitScan](https://xploitscan.com) — 30 core security rules for AI-generated code (up to 210+ with Pro)*`,
+            `*Scanned with [XploitScan](https://xploitscan.com) — 30 core security rules for AI-generated code (up to 223 with Pro)*`,
           ].join('\n');
 
           // Find existing comment to update (avoid duplicates)
@@ -284,37 +429,23 @@ runs:
 
     - name: Check failure threshold
       shell: bash
-      run: |
-        FAIL_ON="${{ inputs.fail-on }}"
-        CRITICAL="${{ steps.scan.outputs.critical-count }}"
-        HIGH="${{ steps.scan.outputs.high-count }}"
-        # The gate counts graded findings only. Vendored/generated/docs
-        # findings are reported and uploaded, but a shadcn/ui primitive that
-        # ships byte-identically in every project on the platform must not
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        CRITICAL: ${{ steps.scan.outputs.critical-count }}
+        HIGH: ${{ steps.scan.outputs.high-count }}
+        MEDIUM: ${{ steps.scan.outputs.medium-count }}
+        LOW: ${{ steps.scan.outputs.low-count }}
+        # The gate counts graded findings only (critical/high/medium/low).
+        # Info never fails the build. Vendored/generated/docs findings are
+        # reported and uploaded, but a shadcn/ui primitive that ships
+        # byte-identically in every project on the platform must not
         # red-line everyone's CI. See packages/shared-rules/src/vendored.ts.
-        FINDINGS="${{ steps.scan.outputs.graded-findings-count }}"
-        UNGRADED="${{ steps.scan.outputs.ungraded-count }}"
-
-        if [ "$FAIL_ON" = "none" ]; then
-          echo "XploitScan: No failure threshold set. Passing."
-          exit 0
-        fi
-
-        if [ "$FAIL_ON" = "critical" ] && [ "$CRITICAL" -gt 0 ] 2>/dev/null; then
-          echo "::error::XploitScan found $CRITICAL critical vulnerabilities"
-          exit 1
-        elif [ "$FAIL_ON" = "high" ] && [ "$((CRITICAL + HIGH))" -gt 0 ] 2>/dev/null; then
-          echo "::error::XploitScan found critical/high vulnerabilities (Critical: $CRITICAL, High: $HIGH)"
-          exit 1
-        elif [ "$FAIL_ON" = "medium" ] && [ "$FINDINGS" -gt 0 ] 2>/dev/null; then
-          echo "::error::XploitScan found $FINDINGS vulnerabilities"
-          exit 1
-        elif [ "$FAIL_ON" = "low" ] && [ "$FINDINGS" -gt 0 ] 2>/dev/null; then
-          echo "::error::XploitScan found $FINDINGS vulnerabilities"
-          exit 1
-        fi
-
-        if [ "${UNGRADED:-0}" -gt 0 ] 2>/dev/null; then
-          echo "XploitScan: $UNGRADED finding(s) in vendored, generated, or documentation files were reported but not counted toward this gate."
-        fi
-        echo "XploitScan: No findings above the '$FAIL_ON' threshold. Passing."
+        UNGRADED: ${{ steps.scan.outputs.ungraded-count }}
+        # Quality findings gate only when asked, and independently of fail-on.
+        # They are a different question from "is this safe to ship", so they get
+        # their own switch rather than riding on the security threshold — and
+        # this check runs even when fail-on is `none`, because opting into one
+        # is not opting into the other.
+        QUALITY_HIGH: ${{ steps.scan.outputs.quality-high-count }}
+        FAIL_ON_QUALITY: ${{ inputs.fail-on-quality }}
+      run: bash "$GITHUB_ACTION_PATH/check-failure-threshold.sh"
